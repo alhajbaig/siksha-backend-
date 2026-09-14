@@ -21,6 +21,29 @@ from backend.db import (
 )
 
 
+def _fetch_all(query_pg: str, query_sqlite: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    """Helper to execute dual-target queries: Cloud PostgreSQL first, SQLite fallback."""
+    from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+    from psycopg2.extras import RealDictCursor
+    if is_supabase_configured():
+        try:
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(query_pg, params)
+                    return [dict(r) for r in cur.fetchall()]
+        except Exception:
+            pass
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(query_sqlite, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
 class GenomeService:
     """Computes real-time, authentic Learning Genome and Cognitive Fingerprint."""
 
@@ -31,9 +54,20 @@ class GenomeService:
         quiz_history = get_user_quiz_history(user_id, limit=30)
 
         # 1. Query topic-level breakdown from quiz_answers joined with practice_questions
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
+        q_pg_topic = """
+        SELECT 
+            qa.subject_id,
+            pq.topic,
+            pq.difficulty,
+            COUNT(*) as total_attempts,
+            SUM(CASE WHEN ans.is_correct = 1 THEN 1 ELSE 0 END) as correct_count
+        FROM public.quiz_answers ans
+        JOIN public.practice_questions pq ON ans.question_id = pq.id
+        JOIN public.quiz_attempts qa ON ans.attempt_id = qa.id
+        WHERE ans.user_id = %s
+        GROUP BY qa.subject_id, pq.topic, pq.difficulty
+        """
+        q_sqlite_topic = """
         SELECT 
             qa.subject_id,
             pq.topic,
@@ -45,9 +79,8 @@ class GenomeService:
         JOIN quiz_attempts qa ON ans.attempt_id = qa.id
         WHERE ans.user_id = ?
         GROUP BY qa.subject_id, pq.topic, pq.difficulty
-        """, (user_id,))
-        topic_stats_raw = [dict(r) for r in cursor.fetchall()]
-        conn.close()
+        """
+        topic_stats_raw = _fetch_all(q_pg_topic, q_sqlite_topic, (user_id,))
 
         # Organize topic metrics by subject dynamically
         subject_topics: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -253,18 +286,12 @@ class GenomeService:
         }
 
         # Query subject attempt history for authentic trend calculation
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-        SELECT subject_id, accuracy_percent, completed_at
-        FROM quiz_attempts
-        WHERE user_id = ?
-        ORDER BY completed_at ASC
-        """, (user_id,))
+        q_pg_att = "SELECT subject_id, accuracy_percent, completed_at FROM public.quiz_attempts WHERE user_id = %s ORDER BY completed_at ASC"
+        q_sqlite_att = "SELECT subject_id, accuracy_percent, completed_at FROM quiz_attempts WHERE user_id = ? ORDER BY completed_at ASC"
+        att_rows = _fetch_all(q_pg_att, q_sqlite_att, (user_id,))
         subject_attempt_history = defaultdict(list)
-        for r in cursor.fetchall():
+        for r in att_rows:
             subject_attempt_history[r["subject_id"]].append(r["accuracy_percent"])
-        conn.close()
 
         subject_genomes = []
         for s in progress.get("subjects", []):
@@ -572,11 +599,29 @@ class GenomeService:
         ]
 
         # 11. Authentic Topic Trees, Mistakes, Gaps, Pathway, and Retention Intelligence
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
         # 11a. Real Mistakes Log with full telemetry (Defensive: question_text + options)
-        cursor.execute("""
+        q_pg_mistakes = """
+        SELECT 
+            qa.subject_id,
+            pq.topic,
+            pq.question_text,
+            pq.option_a,
+            pq.option_b,
+            pq.option_c,
+            pq.option_d,
+            pq.correct_option,
+            pq.explanation,
+            ans.selected_option,
+            COUNT(*) as error_count
+        FROM public.quiz_answers ans
+        JOIN public.practice_questions pq ON ans.question_id = pq.id
+        JOIN public.quiz_attempts qa ON ans.attempt_id = qa.id
+        WHERE ans.user_id = %s AND ans.is_correct = 0
+        GROUP BY qa.subject_id, pq.topic, pq.question_text, pq.option_a, pq.option_b, pq.option_c, pq.option_d, pq.correct_option, pq.explanation, ans.selected_option
+        ORDER BY error_count DESC
+        LIMIT 6
+        """
+        q_sqlite_mistakes = """
         SELECT 
             qa.subject_id,
             pq.topic,
@@ -596,8 +641,8 @@ class GenomeService:
         GROUP BY qa.subject_id, pq.topic, pq.id
         ORDER BY error_count DESC
         LIMIT 6
-        """, (user_id,))
-        mistakes_rows = [dict(r) for r in cursor.fetchall()]
+        """
+        mistakes_rows = _fetch_all(q_pg_mistakes, q_sqlite_mistakes, (user_id,))
 
         frequent_mistakes = []
         for m in mistakes_rows:
@@ -659,34 +704,42 @@ class GenomeService:
             })
 
         # Query topic history for genuine topic-level trend analysis
-        cursor.execute("""
+        q_pg_th = """
+        SELECT pq.topic, ans.is_correct, qa.completed_at
+        FROM public.quiz_answers ans
+        JOIN public.practice_questions pq ON ans.question_id = pq.id
+        JOIN public.quiz_attempts qa ON ans.attempt_id = qa.id
+        WHERE ans.user_id = %s
+        ORDER BY qa.completed_at ASC
+        """
+        q_sqlite_th = """
         SELECT pq.topic, ans.is_correct, qa.completed_at
         FROM quiz_answers ans
         JOIN practice_questions pq ON ans.question_id = pq.id
         JOIN quiz_attempts qa ON ans.attempt_id = qa.id
         WHERE ans.user_id = ?
         ORDER BY qa.completed_at ASC
-        """, (user_id,))
+        """
+        th_rows = _fetch_all(q_pg_th, q_sqlite_th, (user_id,))
         topic_history = defaultdict(list)
-        for r in cursor.fetchall():
+        for r in th_rows:
             topic_history[r["topic"]].append(r["is_correct"])
 
         # 11b. Curriculum topics per subject
-        cursor.execute("""
-        SELECT subject_id, topic, MIN(difficulty) as difficulty, COUNT(*) as q_count
-        FROM practice_questions
-        GROUP BY subject_id, topic
-        ORDER BY subject_id, topic
-        """)
+        q_pg_curric = "SELECT subject_id, topic, MIN(difficulty) as difficulty, COUNT(*) as q_count FROM public.practice_questions GROUP BY subject_id, topic ORDER BY subject_id, topic"
+        q_sqlite_curric = "SELECT subject_id, topic, MIN(difficulty) as difficulty, COUNT(*) as q_count FROM practice_questions GROUP BY subject_id, topic ORDER BY subject_id, topic"
+        curric_rows = _fetch_all(q_pg_curric, q_sqlite_curric)
         curriculum_by_subject = {}
-        for r in cursor.fetchall():
+        for r in curric_rows:
             curriculum_by_subject.setdefault(r['subject_id'], []).append(r)
 
         # Dynamic subjects: derive from student's subjects or practice_subjects table
         available_subj_ids = [s["id"] for s in progress.get("subjects", [])]
         if not available_subj_ids:
-            cursor.execute("SELECT id FROM practice_subjects ORDER BY order_index ASC")
-            available_subj_ids = [r["id"] for r in cursor.fetchall()]
+            q_pg_subjs = "SELECT id FROM public.practice_subjects ORDER BY order_index ASC"
+            q_sqlite_subjs = "SELECT id FROM practice_subjects ORDER BY order_index ASC"
+            sub_rows = _fetch_all(q_pg_subjs, q_sqlite_subjs)
+            available_subj_ids = [r["id"] for r in sub_rows]
         order_subjects = available_subj_ids or ['phys', 'chem', 'math', 'cs']
 
         # Subject tree construction
@@ -831,7 +884,21 @@ class GenomeService:
             })
 
         # 11c. Forgetting / Retention Prediction (Advanced Ebbinghaus Decay & Spaced Repetition Engine)
-        cursor.execute("""
+        q_pg_rec = """
+        SELECT 
+            qa.subject_id,
+            pq.topic,
+            MAX(qa.completed_at) as last_completed_at,
+            COUNT(*) as total_attempts,
+            SUM(CASE WHEN ans.is_correct = 1 THEN 1 ELSE 0 END) as correct_count
+        FROM public.quiz_answers ans
+        JOIN public.practice_questions pq ON ans.question_id = pq.id
+        JOIN public.quiz_attempts qa ON ans.attempt_id = qa.id
+        WHERE ans.user_id = %s
+        GROUP BY qa.subject_id, pq.topic
+        ORDER BY last_completed_at ASC
+        """
+        q_sqlite_rec = """
         SELECT 
             qa.subject_id,
             pq.topic,
@@ -844,9 +911,8 @@ class GenomeService:
         WHERE ans.user_id = ?
         GROUP BY qa.subject_id, pq.topic
         ORDER BY last_completed_at ASC
-        """, (user_id,))
-        topic_recency_rows = [dict(r) for r in cursor.fetchall()]
-        conn.close()
+        """
+        topic_recency_rows = _fetch_all(q_pg_rec, q_sqlite_rec, (user_id,))
 
         now = datetime.now()
         topics_breakdown = []

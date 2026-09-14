@@ -15,7 +15,8 @@ from backend.db import (
     get_classroom_by_id, get_teacher_metrics,
     get_classroom_students, is_student_in_teacher_class,
     get_all_teacher_students, get_teacher_doubts, reply_to_classroom_doubt,
-    get_student_test_history_and_activity
+    get_student_test_history_and_activity,
+    get_teacher_cohort_misconceptions, get_teacher_recent_activity
 )
 from backend.services.genome_service import genome_service
 
@@ -390,5 +391,48 @@ async def suggest_doubt_reply_endpoint(
         "status": "success",
         "suggested_reply": suggestion
     }
+
+
+@router.get("/misconceptions")
+async def get_teacher_cohort_misconceptions_endpoint(
+    subject: Optional[str] = None,
+    class_id: Optional[str] = None,
+    teacher: dict = Depends(require_teacher)
+):
+    """
+    Returns authentic, real-time cohort error rates and conceptual frontiers
+    for students enrolled in the teacher's classrooms.
+    """
+    misconceptions = get_teacher_cohort_misconceptions(
+        teacher_id=teacher["id"],
+        class_id=class_id,
+        subject=subject
+    )
+    return {
+        "status": "success",
+        "misconceptions": misconceptions,
+        "count": len(misconceptions)
+    }
+
+
+@router.get("/recent-activity")
+async def get_teacher_recent_activity_endpoint(
+    limit: Optional[int] = 15,
+    teacher: dict = Depends(require_teacher)
+):
+    """
+    Returns real-time feed of recent student quiz attempts and doubts
+    from students enrolled in the teacher's classrooms.
+    """
+    activities = get_teacher_recent_activity(
+        teacher_id=teacher["id"],
+        limit=limit or 15
+    )
+    return {
+        "status": "success",
+        "activities": activities,
+        "count": len(activities)
+    }
+
 
 

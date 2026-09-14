@@ -1392,21 +1392,7 @@ def delete_session(token: Any):
 
 
 def get_or_create_user_telemetry(user_id: str) -> dict:
-    """Retrieves student learning telemetry, creating default baseline if not yet present."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM user_telemetry WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-
-    if row:
-        conn.close()
-        data = dict(row)
-        data["subject_mastery"] = json.loads(data["subject_mastery_json"])
-        data["knowledge_frontier"] = json.loads(data["knowledge_frontier_json"])
-        return data
-
-    # Default telemetry values
-    now = datetime.utcnow().isoformat()
+    """Retrieves student learning telemetry from Cloud PostgreSQL or SQLite, creating default baseline if not yet present."""
     default_subjects = {
         "Physics": 0.0,
         "Mathematics": 0.0,
@@ -1414,19 +1400,89 @@ def get_or_create_user_telemetry(user_id: str) -> dict:
         "Computer Science": 0.0
     }
     default_frontier = []
+    now = datetime.utcnow().isoformat()
 
-    cursor.execute("""
-    INSERT INTO user_telemetry (
-        user_id, overall_mastery_percent, active_learning_streak_days,
-        questions_solved, socratic_dialogues_count, subject_mastery_json,
-        knowledge_frontier_json, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id, 0.0, 0, 0, 0,
-        json.dumps(default_subjects), json.dumps(default_frontier), now
-    ))
-    conn.commit()
-    conn.close()
+    # 1. Cloud PostgreSQL (Supabase)
+    try:
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        from psycopg2.extras import RealDictCursor
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as pg_cur:
+                    pg_cur.execute("SELECT * FROM public.user_telemetry WHERE user_id = %s LIMIT 1", (user_id,))
+                    row = pg_cur.fetchone()
+                    if row:
+                        data = dict(row)
+                        sm = data.get("subject_mastery_json")
+                        kf = data.get("knowledge_frontier_json")
+                        data["subject_mastery"] = json.loads(sm) if isinstance(sm, str) else (sm or default_subjects)
+                        data["knowledge_frontier"] = json.loads(kf) if isinstance(kf, str) else (kf or default_frontier)
+                        return data
+
+                    # Calculate initial telemetry from any existing quiz attempts if available
+                    pg_cur.execute("SELECT COUNT(*), AVG(accuracy_percent) FROM public.quiz_attempts WHERE user_id = %s", (user_id,))
+                    att_row = pg_cur.fetchone()
+                    tot_solved = 0
+                    init_mastery = 0.0
+                    if att_row and att_row["count"] > 0:
+                        tot_solved = att_row["count"] * 10
+                        init_mastery = round(float(att_row["avg"] or 0.0), 1)
+
+                    pg_cur.execute("""
+                    INSERT INTO public.user_telemetry (
+                        user_id, overall_mastery_percent, active_learning_streak_days,
+                        questions_solved, socratic_dialogues_count, subject_mastery_json,
+                        knowledge_frontier_json, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (user_id) DO UPDATE SET updated_at = NOW()
+                    RETURNING *;
+                    """, (
+                        user_id, init_mastery, 0, tot_solved, 0,
+                        json.dumps(default_subjects), json.dumps(default_frontier)
+                    ))
+                    pg_conn.commit()
+                    new_row = pg_cur.fetchone()
+                    if new_row:
+                        data = dict(new_row)
+                        data["subject_mastery"] = default_subjects
+                        data["knowledge_frontier"] = default_frontier
+                        return data
+    except Exception as err:
+        logger.warning(f"[Supabase Cloud Sync] get_or_create_user_telemetry warning: {err}")
+
+    # 2. Local SQLite fallback
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM user_telemetry WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+
+        if row:
+            conn.close()
+            data = dict(row)
+            sm = data.get("subject_mastery_json")
+            kf = data.get("knowledge_frontier_json")
+            data["subject_mastery"] = json.loads(sm) if isinstance(sm, str) else (sm or default_subjects)
+            data["knowledge_frontier"] = json.loads(kf) if isinstance(kf, str) else (kf or default_frontier)
+            return data
+
+        # Safe insert: check if user exists in SQLite users table first to avoid FK constraint failure
+        cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+        if cursor.fetchone():
+            cursor.execute("""
+            INSERT OR IGNORE INTO user_telemetry (
+                user_id, overall_mastery_percent, active_learning_streak_days,
+                questions_solved, socratic_dialogues_count, subject_mastery_json,
+                knowledge_frontier_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user_id, 0.0, 0, 0, 0,
+                json.dumps(default_subjects), json.dumps(default_frontier), now
+            ))
+            conn.commit()
+        conn.close()
+    except Exception as err:
+        logger.warning(f"[SQLite] get_or_create_user_telemetry warning: {err}")
 
     return {
         "user_id": user_id,
@@ -1465,15 +1521,34 @@ def update_user_telemetry(
     new_mastery = max(10.0, min(99.9, round(telemetry["overall_mastery_percent"] + mastery_delta, 1)))
     now = datetime.utcnow().isoformat()
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    UPDATE user_telemetry
-    SET questions_solved = ?, socratic_dialogues_count = ?, overall_mastery_percent = ?, updated_at = ?
-    WHERE user_id = ?
-    """, (new_solved, new_socratic, new_mastery, now, user_id))
-    conn.commit()
-    conn.close()
+    # 1. Update Cloud PostgreSQL
+    try:
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor() as pg_cur:
+                    pg_cur.execute("""
+                    UPDATE public.user_telemetry
+                    SET questions_solved = %s, socratic_dialogues_count = %s, overall_mastery_percent = %s, updated_at = NOW()
+                    WHERE user_id = %s
+                    """, (new_solved, new_socratic, new_mastery, user_id))
+                    pg_conn.commit()
+    except Exception as err:
+        logger.warning(f"[Supabase] update_user_telemetry warning: {err}")
+
+    # 2. Update SQLite
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+        UPDATE user_telemetry
+        SET questions_solved = ?, socratic_dialogues_count = ?, overall_mastery_percent = ?, updated_at = ?
+        WHERE user_id = ?
+        """, (new_solved, new_socratic, new_mastery, now, user_id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
     telemetry["questions_solved"] = new_solved
     telemetry["socratic_dialogues_count"] = new_socratic
@@ -1953,8 +2028,57 @@ def submit_quiz_attempt(
 def get_quiz_attempt_review(user_id: str, attempt_id: str) -> Optional[dict]:
     """
     Reconstructs the persistent 10-question answer key from quiz_attempts and quiz_answers
-    with strict user isolation.
+    with strict user isolation, supporting both Supabase Cloud PostgreSQL and SQLite.
     """
+    # 1. Supabase Cloud PostgreSQL check
+    try:
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        from psycopg2.extras import RealDictCursor
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as pg_cur:
+                    pg_cur.execute("""
+                    SELECT qa.*, ps.title as subject_title
+                    FROM public.quiz_attempts qa
+                    JOIN public.practice_subjects ps ON qa.subject_id = ps.id
+                    WHERE qa.id = %s AND qa.user_id = %s
+                    """, (attempt_id, user_id))
+                    attempt_row = pg_cur.fetchone()
+                    if attempt_row:
+                        attempt = dict(attempt_row)
+                        if hasattr(attempt.get("completed_at"), "isoformat"):
+                            attempt["completed_at"] = attempt["completed_at"].isoformat()
+                        pg_cur.execute("""
+                        SELECT 
+                            ans.question_id, ans.selected_option, ans.correct_option, ans.is_correct,
+                            pq.question_text, pq.option_a, pq.option_b, pq.option_c, pq.option_d,
+                            pq.explanation, pq.topic, pq.order_index
+                        FROM public.quiz_answers ans
+                        JOIN public.practice_questions pq ON ans.question_id = pq.id
+                        WHERE ans.attempt_id = %s AND ans.user_id = %s
+                        ORDER BY pq.order_index ASC
+                        """, (attempt_id, user_id))
+                        rows = pg_cur.fetchall()
+                        answers_review = []
+                        for r in rows:
+                            options = [r["option_a"], r["option_b"], r["option_c"], r["option_d"]]
+                            answers_review.append({
+                                "question_id": r["question_id"],
+                                "order_index": r["order_index"],
+                                "question_text": r["question_text"],
+                                "options": options,
+                                "selected_option": r["selected_option"],
+                                "correct_option": r["correct_option"],
+                                "is_correct": bool(r["is_correct"]),
+                                "explanation": r["explanation"],
+                                "topic": r["topic"]
+                            })
+                        attempt["answers_review"] = answers_review
+                        return attempt
+    except Exception as err:
+        logger.warning(f"[get_quiz_attempt_review] Supabase fetch fallback: {err}")
+
+    # 2. SQLite local fallback
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -2005,7 +2129,33 @@ def get_quiz_attempt_review(user_id: str, attempt_id: str) -> Optional[dict]:
 
 
 def get_user_quiz_history(user_id: str, limit: int = 50) -> list[dict]:
-    """Retrieves chronological quiz attempts history for the authenticated user."""
+    """Retrieves chronological quiz attempts history for the authenticated user from Supabase or SQLite."""
+    # 1. Supabase Cloud PostgreSQL check
+    try:
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        from psycopg2.extras import RealDictCursor
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as pg_cur:
+                    pg_cur.execute("""
+                    SELECT qa.id, qa.subject_id, ps.title as subject_title, qa.level_number,
+                           qa.score, qa.total_questions, qa.accuracy_percent, qa.time_spent_seconds, qa.completed_at
+                    FROM public.quiz_attempts qa
+                    JOIN public.practice_subjects ps ON qa.subject_id = ps.id
+                    WHERE qa.user_id = %s
+                    ORDER BY qa.completed_at DESC
+                    LIMIT %s
+                    """, (user_id, limit))
+                    rows = [dict(r) for r in pg_cur.fetchall()]
+                    if rows:
+                        for r in rows:
+                            if hasattr(r.get("completed_at"), "isoformat"):
+                                r["completed_at"] = r["completed_at"].isoformat()
+                        return rows
+    except Exception as err:
+        logger.warning(f"[get_user_quiz_history] Supabase fetch fallback: {err}")
+
+    # 2. SQLite local fallback
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -2279,40 +2429,79 @@ def get_student_test_history_and_activity(student_id: str) -> dict:
 # =========================================================================
 
 def get_active_roadmap(user_id: str) -> Optional[dict]:
-    """Fetches active AI Learning Roadmap for authenticated user."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    SELECT id, user_id, title, summary, goal, estimated_duration, progress_snapshot_hash, roadmap_json, status, created_at, updated_at
-    FROM ai_learning_roadmaps
-    WHERE user_id = ? AND status = 'active'
-    ORDER BY updated_at DESC
-    LIMIT 1
-    """, (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
-        return None
-
+    """Fetches active AI Learning Roadmap for authenticated user from Cloud PostgreSQL or SQLite."""
+    # 1. Check Cloud PostgreSQL
     try:
-        roadmap_data = json.loads(row["roadmap_json"])
-    except Exception:
-        roadmap_data = {}
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        from psycopg2.extras import RealDictCursor
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as pg_cur:
+                    pg_cur.execute("""
+                    SELECT id, user_id, title, summary, goal, estimated_duration, progress_snapshot_hash, roadmap_json, status, created_at, updated_at
+                    FROM public.ai_learning_roadmaps
+                    WHERE user_id = %s AND status = 'active'
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """, (user_id,))
+                    row = pg_cur.fetchone()
+                    if row:
+                        d = dict(row)
+                        rm = d.get("roadmap_json")
+                        roadmap_data = json.loads(rm) if isinstance(rm, str) else (rm or {})
+                        return {
+                            "id": d["id"],
+                            "user_id": d["user_id"],
+                            "title": d["title"],
+                            "summary": d["summary"],
+                            "goal": d["goal"],
+                            "estimated_duration": d["estimated_duration"],
+                            "progress_snapshot_hash": d["progress_snapshot_hash"],
+                            "nodes": roadmap_data.get("nodes", []),
+                            "status": d["status"],
+                            "created_at": str(d["created_at"]),
+                            "updated_at": str(d["updated_at"])
+                        }
+    except Exception as err:
+        logger.warning(f"[Supabase] get_active_roadmap warning: {err}")
 
-    return {
-        "id": row["id"],
-        "user_id": row["user_id"],
-        "title": row["title"],
-        "summary": row["summary"],
-        "goal": row["goal"],
-        "estimated_duration": row["estimated_duration"],
-        "progress_snapshot_hash": row["progress_snapshot_hash"],
-        "nodes": roadmap_data.get("nodes", []),
-        "status": row["status"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"]
-    }
+    # 2. SQLite fallback
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT id, user_id, title, summary, goal, estimated_duration, progress_snapshot_hash, roadmap_json, status, created_at, updated_at
+        FROM ai_learning_roadmaps
+        WHERE user_id = ? AND status = 'active'
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """, (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return None
+
+        try:
+            roadmap_data = json.loads(row["roadmap_json"])
+        except Exception:
+            roadmap_data = {}
+
+        return {
+            "id": row["id"],
+            "user_id": row["user_id"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "goal": row["goal"],
+            "estimated_duration": row["estimated_duration"],
+            "progress_snapshot_hash": row["progress_snapshot_hash"],
+            "nodes": roadmap_data.get("nodes", []),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"]
+        }
+    except Exception:
+        return None
 
 
 def save_learning_roadmap(
@@ -2324,28 +2513,49 @@ def save_learning_roadmap(
     progress_snapshot_hash: str,
     roadmap_data: dict
 ) -> dict:
-    """Stores a validated AI Learning Roadmap in SQLite, archiving previous ones."""
+    """Stores a validated AI Learning Roadmap in Cloud PostgreSQL or SQLite, archiving previous ones."""
     import uuid
     roadmap_id = f"rdm_{uuid.uuid4().hex[:12]}"
     now = datetime.utcnow().isoformat()
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # 1. Cloud PostgreSQL
+    try:
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor() as pg_cur:
+                    pg_cur.execute("UPDATE public.ai_learning_roadmaps SET status = 'archived' WHERE user_id = %s AND status = 'active'", (user_id,))
+                    pg_cur.execute("""
+                    INSERT INTO public.ai_learning_roadmaps (
+                        id, user_id, title, summary, goal, estimated_duration,
+                        progress_snapshot_hash, roadmap_json, status, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', NOW(), NOW())
+                    """, (
+                        roadmap_id, user_id, title, summary, goal, estimated_duration,
+                        progress_snapshot_hash, json.dumps(roadmap_data)
+                    ))
+                    pg_conn.commit()
+    except Exception as err:
+        logger.warning(f"[Supabase] save_learning_roadmap warning: {err}")
 
-    # Archive existing active roadmaps
-    cursor.execute("UPDATE ai_learning_roadmaps SET status = 'archived' WHERE user_id = ? AND status = 'active'", (user_id,))
-
-    cursor.execute("""
-    INSERT INTO ai_learning_roadmaps (
-        id, user_id, title, summary, goal, estimated_duration,
-        progress_snapshot_hash, roadmap_json, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
-    """, (
-        roadmap_id, user_id, title, summary, goal, estimated_duration,
-        progress_snapshot_hash, json.dumps(roadmap_data), now, now
-    ))
-    conn.commit()
-    conn.close()
+    # 2. SQLite fallback
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE ai_learning_roadmaps SET status = 'archived' WHERE user_id = ? AND status = 'active'", (user_id,))
+        cursor.execute("""
+        INSERT INTO ai_learning_roadmaps (
+            id, user_id, title, summary, goal, estimated_duration,
+            progress_snapshot_hash, roadmap_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        """, (
+            roadmap_id, user_id, title, summary, goal, estimated_duration,
+            progress_snapshot_hash, json.dumps(roadmap_data), now, now
+        ))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
     return {
         "id": roadmap_id,
@@ -4202,6 +4412,299 @@ def reply_to_classroom_doubt(doubt_id: str, teacher_id: str, reply: str) -> Opti
     conn.close()
 
     return dict(row) if row else None
+
+
+def get_teacher_cohort_misconceptions(
+    teacher_id: str,
+    class_id: Optional[str] = None,
+    subject: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Computes real-time cohort error rates and conceptual frontiers for enrolled students across teacher's classrooms.
+    Queries from Supabase Cloud PostgreSQL with SQLite fallback.
+    Returns authentic topic misconceptions, percentage error rates, affected student counts, and pedagogical recommendations.
+    """
+    from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+    from psycopg2.extras import RealDictCursor
+
+    subj_map = {
+        'physics': 'phys',
+        'phys': 'phys',
+        'mathematics': 'math',
+        'math': 'math',
+        'chemistry': 'chem',
+        'chem': 'chem',
+        'biology': 'bio',
+        'bio': 'bio',
+        'computer science': 'cs',
+        'computer': 'cs',
+        'cs': 'cs'
+    }
+    target_subj_id = None
+    if subject:
+        clean_s = subject.strip().lower()
+        target_subj_id = subj_map.get(clean_s)
+        if not target_subj_id:
+            for k, v in subj_map.items():
+                if k in clean_s:
+                    target_subj_id = v
+                    break
+
+    # 1. Supabase Cloud PostgreSQL (Primary Source of Truth)
+    if is_supabase_configured():
+        try:
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    if class_id:
+                        cur.execute("SELECT id FROM public.classrooms WHERE teacher_id = %s AND id = %s AND is_active = 1", (teacher_id, class_id))
+                    else:
+                        cur.execute("SELECT id FROM public.classrooms WHERE teacher_id = %s AND is_active = 1", (teacher_id,))
+                    c_rows = cur.fetchall()
+                    if not c_rows:
+                        return []
+                    c_ids = [r["id"] for r in c_rows]
+
+                    cur.execute("SELECT DISTINCT student_id FROM public.classroom_members WHERE classroom_id = ANY(%s) AND status = 'active'", (c_ids,))
+                    s_rows = cur.fetchall()
+                    if not s_rows:
+                        return []
+                    student_ids = [r["student_id"] for r in s_rows]
+                    total_cohort_students = len(student_ids)
+
+                    query = """
+                    SELECT 
+                        qa.subject_id,
+                        pq.topic,
+                        COUNT(*) as total_attempts,
+                        SUM(CASE WHEN ans.is_correct = 0 THEN 1 ELSE 0 END) as error_count,
+                        COUNT(DISTINCT ans.user_id) as total_students_attempted,
+                        COUNT(DISTINCT CASE WHEN ans.is_correct = 0 THEN ans.user_id END) as affected_students_count,
+                        MIN(pq.explanation) as sample_explanation,
+                        MIN(pq.question_text) as sample_question
+                    FROM public.quiz_answers ans
+                    JOIN public.practice_questions pq ON ans.question_id = pq.id
+                    JOIN public.quiz_attempts qa ON ans.attempt_id = qa.id
+                    WHERE ans.user_id = ANY(%s)
+                    """
+                    params = [student_ids]
+                    if target_subj_id:
+                        query += " AND qa.subject_id = %s"
+                        params.append(target_subj_id)
+
+                    query += """
+                    GROUP BY qa.subject_id, pq.topic
+                    HAVING SUM(CASE WHEN ans.is_correct = 0 THEN 1 ELSE 0 END) > 0
+                    ORDER BY (SUM(CASE WHEN ans.is_correct = 0 THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)) DESC
+                    LIMIT 20
+                    """
+                    cur.execute(query, tuple(params))
+                    rows = cur.fetchall()
+
+                    results = []
+                    subj_display = {"phys": "Physics", "math": "Mathematics", "chem": "Chemistry", "bio": "Biology", "cs": "Computer Science"}
+                    for r in rows:
+                        tot = int(r["total_attempts"]) or 1
+                        err_cnt = int(r["error_count"]) or 0
+                        rate = round((err_cnt / tot) * 100)
+                        aff = int(r["affected_students_count"]) or 1
+                        risk = "CRITICAL" if rate >= 50 else ("WARNING" if rate >= 30 else "GOOD")
+                        s_id = r["subject_id"]
+                        topic = r["topic"] or "Core Principles"
+
+                        desc = r.get("sample_explanation") or f"Students exhibit recurring difficulty with definition boundaries and problem setups in {topic}."
+                        if len(desc) > 135:
+                            desc = desc[:132] + "..."
+
+                        if risk == "CRITICAL":
+                            action = f"10-min Socratic Diagnostic Drill with pair-interaction isolation on {topic}."
+                        elif risk == "WARNING":
+                            action = f"Interactive visual demonstration and targeted problem set on {topic}."
+                        else:
+                            action = f"Routine practice refresher and milestone review on {topic}."
+
+                        results.append({
+                            "subject_id": s_id,
+                            "subject": subj_display.get(s_id, s_id.capitalize()),
+                            "concept": topic,
+                            "desc": desc,
+                            "rate": rate,
+                            "error_count": err_cnt,
+                            "total_attempts": tot,
+                            "affectedCount": aff,
+                            "totalStudents": total_cohort_students,
+                            "risk": risk,
+                            "action": action
+                        })
+                    return results
+        except Exception as err:
+            logger.error(f"[DB] Supabase error fetching cohort misconceptions: {err}")
+
+    # 2. SQLite fallback
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if class_id:
+            cur.execute("SELECT id FROM classrooms WHERE teacher_id = ? AND id = ? AND is_active = 1", (teacher_id, class_id))
+        else:
+            cur.execute("SELECT id FROM classrooms WHERE teacher_id = ? AND is_active = 1", (teacher_id,))
+        c_rows = cur.fetchall()
+        if not c_rows:
+            conn.close()
+            return []
+        c_ids = [r["id"] for r in c_rows]
+        c_pl = ",".join(["?"] * len(c_ids))
+
+        cur.execute(f"SELECT DISTINCT student_id FROM classroom_members WHERE classroom_id IN ({c_pl}) AND status = 'active'", c_ids)
+        s_rows = cur.fetchall()
+        if not s_rows:
+            conn.close()
+            return []
+        student_ids = [r["student_id"] for r in s_rows]
+        total_cohort_students = len(student_ids)
+
+        s_pl = ",".join(["?"] * len(student_ids))
+        query = f"""
+        SELECT 
+            qa.subject_id,
+            pq.topic,
+            COUNT(*) as total_attempts,
+            SUM(CASE WHEN ans.is_correct = 0 THEN 1 ELSE 0 END) as error_count,
+            COUNT(DISTINCT ans.user_id) as total_students_attempted,
+            COUNT(DISTINCT CASE WHEN ans.is_correct = 0 THEN ans.user_id END) as affected_students_count,
+            MIN(pq.explanation) as sample_explanation
+        FROM quiz_answers ans
+        JOIN practice_questions pq ON ans.question_id = pq.id
+        JOIN quiz_attempts qa ON ans.attempt_id = qa.id
+        WHERE ans.user_id IN ({s_pl})
+        """
+        params = list(student_ids)
+        if target_subj_id:
+            query += " AND qa.subject_id = ?"
+            params.append(target_subj_id)
+
+        query += """
+        GROUP BY qa.subject_id, pq.topic
+        HAVING SUM(CASE WHEN ans.is_correct = 0 THEN 1 ELSE 0 END) > 0
+        ORDER BY (SUM(CASE WHEN ans.is_correct = 0 THEN 1 ELSE 0 END) * 1.0 / MAX(COUNT(*), 1)) DESC
+        LIMIT 20
+        """
+        cur.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+        results = []
+        subj_display = {"phys": "Physics", "math": "Mathematics", "chem": "Chemistry", "bio": "Biology", "cs": "Computer Science"}
+        for r in rows:
+            tot = int(r["total_attempts"]) or 1
+            err_cnt = int(r["error_count"]) or 0
+            rate = round((err_cnt / tot) * 100)
+            aff = int(r["affected_students_count"]) or 1
+            risk = "CRITICAL" if rate >= 50 else ("WARNING" if rate >= 30 else "GOOD")
+            s_id = r["subject_id"]
+            topic = r["topic"] or "Core Principles"
+
+            desc = r.get("sample_explanation") or f"Students exhibit frequent conceptual confusion in {topic}."
+            if len(desc) > 135:
+                desc = desc[:132] + "..."
+
+            results.append({
+                "subject_id": s_id,
+                "subject": subj_display.get(s_id, s_id.capitalize()),
+                "concept": topic,
+                "desc": desc,
+                "rate": rate,
+                "error_count": err_cnt,
+                "total_attempts": tot,
+                "affectedCount": aff,
+                "totalStudents": total_cohort_students,
+                "risk": risk,
+                "action": f"10-min Diagnostic Review Drill on {topic}."
+            })
+        return results
+    except Exception as err:
+        logger.error(f"[DB] SQLite error fetching cohort misconceptions: {err}")
+        return []
+
+
+def get_teacher_recent_activity(teacher_id: str, limit: int = 15) -> List[Dict[str, Any]]:
+    """
+    Returns verified, authentic recent student activity across the teacher's enrolled cohort:
+    - Diagnostic quiz attempts completed by enrolled students
+    - Student doubts asked in classrooms
+    """
+    activities = []
+    from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+    from psycopg2.extras import RealDictCursor
+
+    if is_supabase_configured():
+        try:
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                    SELECT DISTINCT m.student_id, COALESCE(p.full_name, u.full_name, 'Student') as student_name, c.name as class_name
+                    FROM public.classroom_members m
+                    JOIN public.classrooms c ON m.classroom_id = c.id
+                    LEFT JOIN public.profiles p ON m.student_id = p.user_id
+                    LEFT JOIN public.users u ON m.student_id = u.id
+                    WHERE c.teacher_id = %s AND m.status = 'active' AND c.is_active = 1
+                    """, (teacher_id,))
+                    st_rows = cur.fetchall()
+                    if st_rows:
+                        s_map = {r["student_id"]: r for r in st_rows}
+                        s_ids = list(s_map.keys())
+
+                        cur.execute("""
+                        SELECT qa.id, qa.user_id, qa.subject_id, qa.level_number, qa.score, qa.total_questions, qa.accuracy_percent, qa.completed_at
+                        FROM public.quiz_attempts qa
+                        WHERE qa.user_id = ANY(%s)
+                        ORDER BY qa.completed_at DESC
+                        LIMIT %s
+                        """, (s_ids, limit))
+                        attempts = cur.fetchall()
+                        subj_names = {"phys": "Physics", "math": "Mathematics", "chem": "Chemistry", "bio": "Biology", "cs": "Computer Science"}
+                        for a in attempts:
+                            st_info = s_map.get(a["user_id"], {})
+                            s_name = st_info.get("student_name", "Enrolled Student")
+                            c_name = st_info.get("class_name", "Classroom")
+                            s_id = a["subject_id"]
+                            s_title = subj_names.get(s_id, s_id.capitalize())
+                            acc = float(a["accuracy_percent"] or 0.0)
+                            badge = "badge-emerald" if acc >= 80 else ("badge-indigo" if acc >= 50 else "badge-rose")
+                            activities.append({
+                                "type": "quiz_attempt",
+                                "student_name": s_name,
+                                "class_name": c_name,
+                                "title": f"{s_name} completed {s_title} Level {a['level_number']}",
+                                "score": f"{a['score']}/{a['total_questions']}",
+                                "accuracy": f"{acc}%",
+                                "badge_class": badge,
+                                "created_at": str(a["completed_at"]) if a.get("completed_at") else ""
+                            })
+
+                        cur.execute("""
+                        SELECT d.id, d.student_name, d.question, d.topic, d.status, d.created_at, c.name as class_name
+                        FROM public.classroom_doubts d
+                        JOIN public.classrooms c ON d.classroom_id = c.id
+                        WHERE c.teacher_id = %s
+                        ORDER BY d.created_at DESC
+                        LIMIT %s
+                        """, (teacher_id, limit))
+                        doubts = cur.fetchall()
+                        for d in doubts:
+                            activities.append({
+                                "type": "doubt",
+                                "student_name": d["student_name"],
+                                "class_name": d["class_name"],
+                                "title": f"Doubt from {d['student_name']}: {d['question'][:50]}...",
+                                "score": d.get("topic") or "Concept Question",
+                                "accuracy": "Needs Attention" if d["status"] == "open" else "Answered",
+                                "badge_class": "badge-rose" if d["status"] == "open" else "badge-emerald",
+                                "created_at": str(d["created_at"])
+                            })
+        except Exception as err:
+            logger.warning(f"[Supabase] get_teacher_recent_activity warning: {err}")
+
+    return activities
 
 
 # Initialize DB and seed baseline users & practice data when module is loaded
