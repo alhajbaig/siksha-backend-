@@ -2024,6 +2024,81 @@ def get_user_quiz_history(user_id: str, limit: int = 50) -> list[dict]:
 
 def get_user_progress_summary(user_id: str) -> dict:
     """Single Source of Truth for Progress Engine across Practice, Dashboard, and Progress pages."""
+    # Attempt querying Supabase PostgreSQL first for production persistence
+    try:
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        from psycopg2.extras import RealDictCursor
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as pg_cur:
+                    pg_cur.execute("SELECT id, title, description, icon, order_index FROM public.practice_subjects ORDER BY order_index ASC")
+                    subjects_raw = [dict(r) for r in pg_cur.fetchall()]
+                    if subjects_raw:
+                        subjects_progress = []
+                        total_completed_levels = 0
+                        for s in subjects_raw:
+                            s_id = s["id"]
+                            pg_cur.execute("""
+                            SELECT DISTINCT level_number, MAX(score) as best_score, MAX(accuracy_percent) as best_acc
+                            FROM public.quiz_attempts
+                            WHERE user_id = %s AND subject_id = %s
+                            GROUP BY level_number
+                            """, (user_id, s_id))
+                            completed_rows = [dict(r) for r in pg_cur.fetchall()]
+                            completed_cnt = len(completed_rows)
+                            total_completed_levels += completed_cnt
+                            avg_acc = round(sum(r["best_acc"] for r in completed_rows) / len(completed_rows), 1) if completed_rows else 0.0
+
+                            subjects_progress.append({
+                                "id": s_id,
+                                "title": s["title"],
+                                "icon": s["icon"],
+                                "description": s["description"],
+                                "completed_levels": completed_cnt,
+                                "total_levels": 5,
+                                "progress_percent": round((completed_cnt / 5.0) * 100, 1),
+                                "accuracy_percent": avg_acc,
+                                "unlocked_level": min(completed_cnt + 1, 5)
+                            })
+
+                        pg_cur.execute("SELECT COUNT(*), SUM(is_correct) FROM public.quiz_answers WHERE user_id = %s", (user_id,))
+                        ans_stats = pg_cur.fetchone()
+                        total_answers = (ans_stats["count"] if ans_stats and "count" in ans_stats else 0)
+                        correct_answers = (ans_stats["sum"] if ans_stats and "sum" in ans_stats and ans_stats["sum"] is not None else 0)
+                        overall_accuracy = round((correct_answers / max(total_answers, 1)) * 100, 1) if total_answers > 0 else 0.0
+
+                        pg_cur.execute("""
+                        SELECT qa.id, qa.subject_id, ps.title as subject_title, qa.level_number, qa.score, qa.total_questions, qa.accuracy_percent, qa.completed_at
+                        FROM public.quiz_attempts qa
+                        JOIN public.practice_subjects ps ON qa.subject_id = ps.id
+                        WHERE qa.user_id = %s
+                        ORDER BY qa.completed_at DESC
+                        LIMIT 10
+                        """, (user_id,))
+                        recent_activity = []
+                        for r in pg_cur.fetchall():
+                            rec = dict(r)
+                            if hasattr(rec.get("completed_at"), "isoformat"):
+                                rec["completed_at"] = rec["completed_at"].isoformat()
+                            recent_activity.append(rec)
+
+                        total_levels_count = len(subjects_raw) * 5
+                        overall_progress_percent = round((total_completed_levels / float(total_levels_count or 25)) * 100, 1)
+
+                        return {
+                            "completed_levels_count": total_completed_levels,
+                            "total_levels_count": total_levels_count,
+                            "overall_progress_percent": overall_progress_percent,
+                            "total_questions_solved": total_answers,
+                            "total_correct_answers": correct_answers,
+                            "overall_accuracy_percent": overall_accuracy,
+                            "subjects": subjects_progress,
+                            "recent_activity": recent_activity
+                        }
+    except Exception:
+        pass
+
+    # Seamless fallback to SQLite
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -2090,6 +2165,112 @@ def get_user_progress_summary(user_id: str) -> dict:
         "overall_accuracy_percent": overall_accuracy,
         "subjects": subjects_progress,
         "recent_activity": recent_activity
+    }
+
+
+def get_student_test_history_and_activity(student_id: str) -> dict:
+    """Returns comprehensive test history, quiz attempts, and activity timeline for educator inspection."""
+    user = get_user_by_id(student_id)
+    student_name = user.get("full_name", "Student") if user else "Student"
+    student_email = user.get("email", "") if user else ""
+
+    quiz_attempts = []
+    total_answers = 0
+    correct_answers = 0
+
+    # Try Supabase PostgreSQL first
+    try:
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        from psycopg2.extras import RealDictCursor
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as pg_cur:
+                    pg_cur.execute("""
+                    SELECT qa.id, qa.subject_id, COALESCE(ps.title, qa.subject_id) as subject_title,
+                           qa.level_number, qa.score, qa.total_questions, qa.accuracy_percent,
+                           qa.time_spent_seconds, qa.completed_at
+                    FROM public.quiz_attempts qa
+                    LEFT JOIN public.practice_subjects ps ON qa.subject_id = ps.id
+                    WHERE qa.user_id = %s
+                    ORDER BY qa.completed_at DESC
+                    LIMIT 50
+                    """, (student_id,))
+                    for r in pg_cur.fetchall():
+                        rec = dict(r)
+                        if hasattr(rec.get("completed_at"), "isoformat"):
+                            rec["completed_at"] = rec["completed_at"].isoformat()
+                        rec["status"] = "Passed" if (rec.get("accuracy_percent") or 0) >= 60 else "Needs Review"
+                        quiz_attempts.append(rec)
+
+                    pg_cur.execute("SELECT COUNT(*), SUM(is_correct) FROM public.quiz_answers WHERE user_id = %s", (student_id,))
+                    ans_stats = pg_cur.fetchone()
+                    if ans_stats:
+                        total_answers = ans_stats["count"] if "count" in ans_stats else 0
+                        correct_answers = ans_stats["sum"] if "sum" in ans_stats and ans_stats["sum"] is not None else 0
+    except Exception:
+        pass
+
+    # Fallback to SQLite if no quiz attempts found from PostgreSQL
+    if not quiz_attempts:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+            SELECT qa.id, qa.subject_id, COALESCE(ps.title, qa.subject_id) as subject_title,
+                   qa.level_number, qa.score, qa.total_questions, qa.accuracy_percent,
+                   qa.time_spent_seconds, qa.completed_at
+            FROM quiz_attempts qa
+            LEFT JOIN practice_subjects ps ON qa.subject_id = ps.id
+            WHERE qa.user_id = ?
+            ORDER BY qa.completed_at DESC
+            LIMIT 50
+            """, (student_id,))
+            for r in cursor.fetchall():
+                rec = dict(r)
+                rec["status"] = "Passed" if (rec.get("accuracy_percent") or 0) >= 60 else "Needs Review"
+                quiz_attempts.append(rec)
+
+            cursor.execute("SELECT COUNT(*), SUM(is_correct) FROM quiz_answers WHERE user_id = ?", (student_id,))
+            ans_stats = cursor.fetchone()
+            if ans_stats:
+                total_answers = ans_stats[0] or 0
+                correct_answers = ans_stats[1] or 0
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    # Compute summary
+    total_tests = len(quiz_attempts)
+    avg_accuracy = round(sum(q["accuracy_percent"] for q in quiz_attempts) / max(total_tests, 1), 1) if total_tests > 0 else 0.0
+    completed_levels = len({f"{q['subject_id']}_{q['level_number']}" for q in quiz_attempts})
+
+    # Build chronological activity events
+    activity_timeline = []
+    for q in quiz_attempts:
+        mins = round((q.get("time_spent_seconds") or 0) / 60, 1)
+        activity_timeline.append({
+            "type": "quiz_completed",
+            "title": f"Completed {q.get('subject_title', 'Subject')} Level {q.get('level_number', 1)} Quiz",
+            "description": f"Scored {q.get('score', 0)}/{q.get('total_questions', 10)} ({q.get('accuracy_percent', 0)}% accuracy) in {mins} min",
+            "status": q.get("status", "Completed"),
+            "timestamp": q.get("completed_at", "")
+        })
+
+    return {
+        "status": "success",
+        "student_id": student_id,
+        "student_name": student_name,
+        "student_email": student_email,
+        "summary": {
+            "total_tests_completed": total_tests,
+            "total_questions_solved": total_answers,
+            "total_correct_answers": correct_answers,
+            "overall_accuracy_percent": avg_accuracy,
+            "completed_levels_count": completed_levels
+        },
+        "quiz_history": quiz_attempts,
+        "activity_timeline": activity_timeline
     }
 
 

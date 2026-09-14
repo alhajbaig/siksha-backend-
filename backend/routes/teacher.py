@@ -14,7 +14,8 @@ from backend.db import (
     create_classroom, get_teacher_classrooms,
     get_classroom_by_id, get_teacher_metrics,
     get_classroom_students, is_student_in_teacher_class,
-    get_all_teacher_students, get_teacher_doubts, reply_to_classroom_doubt
+    get_all_teacher_students, get_teacher_doubts, reply_to_classroom_doubt,
+    get_student_test_history_and_activity
 )
 from backend.services.genome_service import genome_service
 
@@ -229,6 +230,26 @@ async def get_student_genome_for_teacher(
         "student_id": student_id,
         "genome": genome
     }
+
+
+@router.get("/students/{student_id}/activity")
+async def get_student_activity_for_teacher(
+    student_id: str,
+    teacher: dict = Depends(require_teacher)
+):
+    """
+    Returns authentic chronological test history, quiz scores, accuracy,
+    and activity timeline for a student enrolled in the teacher's classroom.
+    """
+    authorized = is_student_in_teacher_class(teacher["id"], student_id)
+    if not authorized:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Student is not an active enrolled member in any of your classrooms."
+        )
+
+    activity_data = get_student_test_history_and_activity(student_id)
+    return activity_data
 
 
 @router.get("/students")
