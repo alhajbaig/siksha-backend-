@@ -13,7 +13,7 @@ class UserRole(str, Enum):
 class UserLoginRequest(BaseModel):
     email: EmailStr
     password: str
-    role: Optional[UserRole] = UserRole.STUDENT
+    role: Optional[UserRole] = None
 
 class UserSignUpRequest(BaseModel):
     full_name: str

@@ -39,7 +39,7 @@ class Settings(BaseModel):
     GROQ_CHATBOT_API_KEY: str = os.getenv("GROQ_CHATBOT_API_KEY", os.getenv("GROQ_API_KEY", ""))
     GROQ_ROADMAP_API_KEY: str = os.getenv("GROQ_ROADMAP_API_KEY", os.getenv("GROQ_API_KEY", ""))
     GROQ_TEXT_MODEL: str = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
-    GROQ_FALLBACK_MODELS: list[str] = ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "groq/compound-mini", "allam-2-7b"]
+    GROQ_FALLBACK_MODELS: list[str] = ["openai/gpt-oss-20b", "groq/compound-mini", "qwen/qwen3.6-27b", "groq/compound"]
     GROQ_VISION_MODEL: str = "llama-3.2-11b-vision-preview"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     DEFAULT_CHUNK_SIZE: int = 512

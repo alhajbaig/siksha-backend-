@@ -5004,7 +5004,20 @@ def mark_guidance_completed(student_id: str, guidance_id: str) -> Optional[Dict[
         return None
 
 
-# Initialize DB and seed baseline users & practice data when module is loaded
+# Initialize DB and seed baseline users & practice data
 init_db()
-seed_default_users()
-seed_practice_data()
+
+def _ensure_initial_seeds():
+    try:
+        seed_default_users()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM practice_questions")
+        count = cursor.fetchone()[0]
+        conn.close()
+        if count < 50:
+            seed_practice_data()
+    except Exception as e:
+        logger.warning(f"[DB Startup] Seed check note: {e}")
+
+_ensure_initial_seeds()

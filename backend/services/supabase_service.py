@@ -42,6 +42,27 @@ def get_supabase_client() -> Optional[Client]:
         return None
 
 
+def _resolve_pg_credentials():
+    """
+    Resolves host and user to IPv4 Supabase Pooler.
+    Render free/standard containers lack outbound IPv6 routing.
+    Direct db.<ref>.supabase.co hostnames resolve to IPv6 only and hang for 40s.
+    """
+    host = settings.SUPABASE_DB_HOST or ""
+    user = settings.SUPABASE_DB_USER or ""
+    port = settings.SUPABASE_DB_PORT or 5432
+    password = settings.SUPABASE_DB_PASSWORD or ""
+    dbname = settings.SUPABASE_DB_NAME or "postgres"
+
+    # Auto-reroute direct Supabase domain to IPv4 Pooler
+    if "hmxbwitnmrjbtrozkvul" in host or ("supabase.co" in host and "pooler" not in host):
+        host = "aws-0-ap-northeast-2.pooler.supabase.com"
+        if user == "postgres" or not user:
+            user = "postgres.hmxbwitnmrjbtrozkvul"
+
+    return host, port, user, password, dbname
+
+
 def init_pg_pool():
     """Initializes the PostgreSQL threaded connection pool for high-throughput queries."""
     global _pg_pool
@@ -51,19 +72,21 @@ def init_pg_pool():
     if not settings.SUPABASE_DB_HOST or not settings.SUPABASE_DB_PASSWORD:
         return
 
+    host, port, user, password, dbname = _resolve_pg_credentials()
+
     try:
         _pg_pool = pool.ThreadedConnectionPool(
             minconn=1,
             maxconn=10,
-            host=settings.SUPABASE_DB_HOST,
-            port=settings.SUPABASE_DB_PORT,
-            user=settings.SUPABASE_DB_USER,
-            password=settings.SUPABASE_DB_PASSWORD,
-            dbname=settings.SUPABASE_DB_NAME,
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            dbname=dbname,
             sslmode="require",
-            connect_timeout=10
+            connect_timeout=6
         )
-        logger.info("[Supabase PostgreSQL] Threaded connection pool initialized (1-10 connections).")
+        logger.info(f"[Supabase PostgreSQL] Threaded connection pool initialized on {host} (1-10 connections).")
     except Exception as err:
         logger.error(f"[Supabase PostgreSQL] Could not initialize connection pool: {err}")
 
@@ -81,14 +104,15 @@ def get_pg_connection():
             conn = _pg_pool.getconn()
             from_pool = True
         else:
+            host, port, user, password, dbname = _resolve_pg_credentials()
             conn = psycopg2.connect(
-                host=settings.SUPABASE_DB_HOST,
-                port=settings.SUPABASE_DB_PORT,
-                user=settings.SUPABASE_DB_USER,
-                password=settings.SUPABASE_DB_PASSWORD,
-                dbname=settings.SUPABASE_DB_NAME,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                dbname=dbname,
                 sslmode="require",
-                connect_timeout=10
+                connect_timeout=6
             )
         yield conn
     except Exception:

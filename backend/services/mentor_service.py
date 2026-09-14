@@ -331,7 +331,8 @@ class MentorService:
         client = await self._get_client()
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": "SikshaSaathi-App/2.0"
         }
 
         models = [settings.GROQ_TEXT_MODEL] + settings.GROQ_FALLBACK_MODELS
