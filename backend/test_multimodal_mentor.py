@@ -53,7 +53,7 @@ def run_multimodal_tests():
     auth_data = login_res.json()
     token = auth_data["access_token"]
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    print("[1] [PASS] Authenticated as Aarav Sharma")
+    print("[1] [PASS] Authenticated as Student User")
 
     # 2. Create Multimodal Conversation
     conv_res = client.post("/api/mentor/conversations", json={

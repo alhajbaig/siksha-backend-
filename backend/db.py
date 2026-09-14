@@ -1563,7 +1563,7 @@ def seed_default_users():
         {
             "email": "aarav@siksha.edu",
             "password": "student123",
-            "full_name": "Aarav Sharma",
+            "full_name": "Student User",
             "role": "student",
             "class_grade": "Class 12 • Senior Secondary",
             "target_goal": "JEE Advanced 2027 & CBSE 12",
@@ -4284,7 +4284,7 @@ def get_classroom_hub_data(classroom_id: str, student_id: str = None) -> Dict[st
         doubts = [
             {
                 "id": "dbt_seed_1",
-                "student_name": "Aarav Sharma",
+                "student_name": "Student User",
                 "question": "Why does kinetic friction remain independent of the surface area of contact?",
                 "topic": "Friction & Forces",
                 "ai_hint": "Socratic hint: Think about the microscopic contact points. If apparent area increases, what happens to the pressure at each microscopic junction?",
