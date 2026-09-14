@@ -11,7 +11,8 @@ from backend.db import (
     get_user_progress_summary, get_or_create_profile,
     update_user_profile, get_classroom_by_code, get_classroom_by_id,
     get_student_classrooms, join_classroom, leave_classroom,
-    get_classroom_hub_data, add_classroom_doubt
+    get_classroom_hub_data, add_classroom_doubt,
+    get_student_received_guidance, mark_guidance_completed
 )
 from backend.services.genome_service import genome_service
 
@@ -486,6 +487,51 @@ async def post_classroom_doubt_endpoint(
         "message": "Your question was delivered to your teacher's Doubt Desk.",
         "doubt": doubt
     }
+
+
+@router.get("/guidance")
+async def get_student_guidance_endpoint(
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+    x_auth_token: Optional[str] = Header(None)
+):
+    """
+    Returns personalized guidance, targeted practice drills, and Socratic hints
+    dispatched directly to this student by their educators.
+    """
+    user = _resolve_user(authorization, x_user_id, x_auth_token, require_auth=True)
+    guidance_list = get_student_received_guidance(user["id"])
+    return {
+        "status": "success",
+        "guidance": guidance_list,
+        "count": len(guidance_list)
+    }
+
+
+@router.post("/guidance/{guidance_id}/complete")
+async def complete_student_guidance_endpoint(
+    guidance_id: str,
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+    x_auth_token: Optional[str] = Header(None)
+):
+    """
+    Marks personalized educator guidance as completed/understood by the student.
+    Synchronizes status with teacher portal in real time.
+    """
+    user = _resolve_user(authorization, x_user_id, x_auth_token, require_auth=True)
+    updated = mark_guidance_completed(user["id"], guidance_id)
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Guidance item not found or does not belong to this student."
+        )
+    return {
+        "status": "success",
+        "message": "Guidance item marked completed successfully.",
+        "guidance": updated
+    }
+
 
 
 

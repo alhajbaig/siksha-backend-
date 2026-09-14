@@ -487,6 +487,23 @@ def init_db():
     );
     """)
 
+    # Teacher Guidance & Interventions table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS teacher_guidance (
+        id TEXT PRIMARY KEY,
+        teacher_id TEXT NOT NULL,
+        student_id TEXT NOT NULL,
+        classroom_id TEXT,
+        guidance_type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY (teacher_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (student_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    """)
+
     # Schema migration: add columns if missing (safe for existing DBs)
     # Must run BEFORE index creation to ensure new columns exist
     _safe_add_columns(conn)
@@ -525,6 +542,9 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ca_class ON classroom_announcements(classroom_id);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cm_class_mat ON classroom_materials(classroom_id, subject);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cd_class_dbt ON classroom_doubts(classroom_id, created_at);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tg_teacher ON teacher_guidance(teacher_id);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tg_student ON teacher_guidance(student_id);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tg_status ON teacher_guidance(status);")
 
     conn.commit()
     conn.close()
@@ -4705,6 +4725,283 @@ def get_teacher_recent_activity(teacher_id: str, limit: int = 15) -> List[Dict[s
             logger.warning(f"[Supabase] get_teacher_recent_activity warning: {err}")
 
     return activities
+
+
+# =========================================================================
+# TEACHER PERSONALIZED GUIDANCE & MENTORSHIP ENGINE
+# =========================================================================
+
+def create_teacher_guidance(
+    teacher_id: str,
+    student_id: str,
+    guidance_type: str,
+    message: str,
+    classroom_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Persists educator guidance/recommendation targeted to a specific student.
+    Writes to Supabase Cloud PostgreSQL and SQLite.
+    """
+    from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+    from psycopg2.extras import RealDictCursor
+
+    guidance_id = f"gd_{secrets.token_hex(6)}"
+    now_dt = datetime.utcnow()
+    now_iso = now_dt.isoformat()
+
+    # 1. Supabase PostgreSQL
+    if is_supabase_configured():
+        try:
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                    INSERT INTO public.teacher_guidance (
+                        id, teacher_id, student_id, classroom_id, guidance_type, message, status, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, 'pending', NOW())
+                    RETURNING id, teacher_id, student_id, classroom_id, guidance_type, message, status, created_at;
+                    """, (guidance_id, teacher_id, student_id, classroom_id, guidance_type, message))
+                    row = cur.fetchone()
+                    pg_conn.commit()
+                    if row:
+                        row_dict = dict(row)
+                        row_dict["created_at"] = str(row_dict["created_at"])
+                        # Also sync to SQLite for parity
+                        try:
+                            s_conn = get_db_connection()
+                            s_cur = s_conn.cursor()
+                            s_cur.execute("""
+                            INSERT OR REPLACE INTO teacher_guidance (
+                                id, teacher_id, student_id, classroom_id, guidance_type, message, status, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                            """, (guidance_id, teacher_id, student_id, classroom_id, guidance_type, message, now_iso))
+                            s_conn.commit()
+                            s_conn.close()
+                        except Exception:
+                            pass
+                        return row_dict
+        except Exception as err:
+            logger.warning(f"[Supabase] create_teacher_guidance error: {err}")
+
+    # 2. SQLite Fallback
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO teacher_guidance (
+        id, teacher_id, student_id, classroom_id, guidance_type, message, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+    """, (guidance_id, teacher_id, student_id, classroom_id, guidance_type, message, now_iso))
+    conn.commit()
+    conn.close()
+
+    return {
+        "id": guidance_id,
+        "teacher_id": teacher_id,
+        "student_id": student_id,
+        "classroom_id": classroom_id,
+        "guidance_type": guidance_type,
+        "message": message,
+        "status": "pending",
+        "created_at": now_iso
+    }
+
+
+def get_teacher_dispatched_guidance(teacher_id: str) -> List[Dict[str, Any]]:
+    """
+    Returns all guidance dispatched by this educator, joined with student details and completion status.
+    """
+    from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+    from psycopg2.extras import RealDictCursor
+
+    items = []
+    # 1. Supabase PostgreSQL
+    if is_supabase_configured():
+        try:
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                    SELECT 
+                        g.id, g.teacher_id, g.student_id, g.classroom_id, g.guidance_type, g.message, g.status,
+                        g.created_at, g.completed_at,
+                        COALESCE(NULLIF(p.full_name, ''), NULLIF(u.full_name, ''), u.email, 'Enrolled Student') as student_name,
+                        COALESCE(u.class_grade, p.class_level, 'Class 12') as class_grade,
+                        c.name as class_name
+                    FROM public.teacher_guidance g
+                    LEFT JOIN public.users u ON g.student_id = u.id
+                    LEFT JOIN public.profiles p ON g.student_id = p.user_id
+                    LEFT JOIN public.classrooms c ON g.classroom_id = c.id
+                    WHERE g.teacher_id = %s
+                    ORDER BY g.created_at DESC
+                    LIMIT 50;
+                    """, (teacher_id,))
+                    rows = cur.fetchall()
+                    for r in rows:
+                        d = dict(r)
+                        d["created_at"] = str(d["created_at"]) if d.get("created_at") else ""
+                        d["completed_at"] = str(d["completed_at"]) if d.get("completed_at") else None
+                        items.append(d)
+                    return items
+        except Exception as err:
+            logger.warning(f"[Supabase] get_teacher_dispatched_guidance error: {err}")
+
+    # 2. SQLite Fallback
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT 
+            g.id, g.teacher_id, g.student_id, g.classroom_id, g.guidance_type, g.message, g.status,
+            g.created_at, g.completed_at,
+            COALESCE(NULLIF(p.full_name, ''), NULLIF(u.full_name, ''), u.email, 'Enrolled Student') as student_name,
+            COALESCE(u.class_grade, p.class_level, 'Class 12') as class_grade,
+            c.name as class_name
+        FROM teacher_guidance g
+        LEFT JOIN users u ON g.student_id = u.id
+        LEFT JOIN profiles p ON g.student_id = p.user_id
+        LEFT JOIN classrooms c ON g.classroom_id = c.id
+        WHERE g.teacher_id = ?
+        ORDER BY g.created_at DESC
+        LIMIT 50
+        """, (teacher_id,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.warning(f"[SQLite] get_teacher_dispatched_guidance error: {e}")
+        return []
+
+
+def get_student_received_guidance(student_id: str) -> List[Dict[str, Any]]:
+    """
+    Returns all guidance received by the student from educators, joined with teacher name, institution, and class.
+    """
+    from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+    from psycopg2.extras import RealDictCursor
+
+    items = []
+    # 1. Supabase PostgreSQL
+    if is_supabase_configured():
+        try:
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                    SELECT 
+                        g.id, g.teacher_id, g.student_id, g.classroom_id, g.guidance_type, g.message, g.status,
+                        g.created_at, g.completed_at,
+                        COALESCE(NULLIF(p.full_name, ''), NULLIF(u.full_name, ''), u.email, 'Class Teacher') as teacher_name,
+                        COALESCE(u.institution, p.institution, '') as teacher_institution,
+                        COALESCE(u.subject, p.preferred_subject, c.subject, 'Academics') as teacher_subject,
+                        c.name as class_name,
+                        c.subject as class_subject
+                    FROM public.teacher_guidance g
+                    LEFT JOIN public.users u ON g.teacher_id = u.id
+                    LEFT JOIN public.profiles p ON g.teacher_id = p.user_id
+                    LEFT JOIN public.classrooms c ON g.classroom_id = c.id
+                    WHERE g.student_id = %s
+                    ORDER BY g.created_at DESC
+                    LIMIT 30;
+                    """, (student_id,))
+                    rows = cur.fetchall()
+                    for r in rows:
+                        d = dict(r)
+                        d["created_at"] = str(d["created_at"]) if d.get("created_at") else ""
+                        d["completed_at"] = str(d["completed_at"]) if d.get("completed_at") else None
+                        items.append(d)
+                    return items
+        except Exception as err:
+            logger.warning(f"[Supabase] get_student_received_guidance error: {err}")
+
+    # 2. SQLite Fallback
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT 
+            g.id, g.teacher_id, g.student_id, g.classroom_id, g.guidance_type, g.message, g.status,
+            g.created_at, g.completed_at,
+            COALESCE(NULLIF(p.full_name, ''), NULLIF(u.full_name, ''), u.email, 'Class Teacher') as teacher_name,
+            COALESCE(u.institution, p.institution, '') as teacher_institution,
+            COALESCE(u.subject, p.preferred_subject, c.subject, 'Academics') as teacher_subject,
+            c.name as class_name,
+            c.subject as class_subject
+        FROM teacher_guidance g
+        LEFT JOIN users u ON g.teacher_id = u.id
+        LEFT JOIN profiles p ON g.teacher_id = p.user_id
+        LEFT JOIN classrooms c ON g.classroom_id = c.id
+        WHERE g.student_id = ?
+        ORDER BY g.created_at DESC
+        LIMIT 30
+        """, (student_id,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.warning(f"[SQLite] get_student_received_guidance error: {e}")
+        return []
+
+
+def mark_guidance_completed(student_id: str, guidance_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Marks guidance as completed by student, recording the completion timestamp.
+    """
+    from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+    from psycopg2.extras import RealDictCursor
+
+    # 1. Supabase PostgreSQL
+    if is_supabase_configured():
+        try:
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                    UPDATE public.teacher_guidance
+                    SET status = 'completed', completed_at = NOW()
+                    WHERE id = %s AND student_id = %s
+                    RETURNING id, teacher_id, student_id, guidance_type, message, status, created_at, completed_at;
+                    """, (guidance_id, student_id))
+                    row = cur.fetchone()
+                    pg_conn.commit()
+                    if row:
+                        d = dict(row)
+                        d["created_at"] = str(d["created_at"]) if d.get("created_at") else ""
+                        d["completed_at"] = str(d["completed_at"]) if d.get("completed_at") else ""
+                        # SQLite sync
+                        try:
+                            s_conn = get_db_connection()
+                            s_cur = s_conn.cursor()
+                            s_cur.execute("""
+                            UPDATE teacher_guidance
+                            SET status = 'completed', completed_at = ?
+                            WHERE id = ? AND student_id = ?
+                            """, (d["completed_at"], guidance_id, student_id))
+                            s_conn.commit()
+                            s_conn.close()
+                        except Exception:
+                            pass
+                        return d
+        except Exception as err:
+            logger.warning(f"[Supabase] mark_guidance_completed error: {err}")
+
+    # 2. SQLite Fallback
+    try:
+        now_str = datetime.utcnow().isoformat()
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+        UPDATE teacher_guidance
+        SET status = 'completed', completed_at = ?
+        WHERE id = ? AND student_id = ?
+        """, (now_str, guidance_id, student_id))
+        conn.commit()
+        cur.execute("""
+        SELECT id, teacher_id, student_id, guidance_type, message, status, created_at, completed_at
+        FROM teacher_guidance
+        WHERE id = ? AND student_id = ?
+        """, (guidance_id, student_id))
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.warning(f"[SQLite] mark_guidance_completed error: {e}")
+        return None
 
 
 # Initialize DB and seed baseline users & practice data when module is loaded

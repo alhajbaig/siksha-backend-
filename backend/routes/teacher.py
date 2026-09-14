@@ -16,7 +16,8 @@ from backend.db import (
     get_classroom_students, is_student_in_teacher_class,
     get_all_teacher_students, get_teacher_doubts, reply_to_classroom_doubt,
     get_student_test_history_and_activity,
-    get_teacher_cohort_misconceptions, get_teacher_recent_activity
+    get_teacher_cohort_misconceptions, get_teacher_recent_activity,
+    create_teacher_guidance, get_teacher_dispatched_guidance
 )
 from backend.services.genome_service import genome_service
 
@@ -40,6 +41,13 @@ class CreateClassroomRequest(BaseModel):
 
 class ReplyDoubtRequest(BaseModel):
     reply: str = Field(..., min_length=2, max_length=2000, description="Educator guidance/answer for the student")
+
+
+class DispatchGuidanceRequest(BaseModel):
+    student_id: str = Field(..., min_length=2, description="Targeted student's user ID")
+    guidance_type: str = Field("Targeted Practice", description="Guidance or intervention category")
+    message: str = Field(..., min_length=2, max_length=2000, description="Educator recommendation or Socratic note")
+    classroom_id: Optional[str] = Field(None, description="Associated classroom ID")
 
 
 @router.get("/profile")
@@ -433,6 +441,46 @@ async def get_teacher_recent_activity_endpoint(
         "activities": activities,
         "count": len(activities)
     }
+
+
+@router.post("/guidance")
+async def dispatch_teacher_guidance_endpoint(
+    req: DispatchGuidanceRequest,
+    teacher: dict = Depends(require_teacher)
+):
+    """
+    Dispatches personalized guidance or a targeted Socratic recommendation to an enrolled student.
+    Persists across Supabase Cloud PostgreSQL and SQLite.
+    """
+    guidance = create_teacher_guidance(
+        teacher_id=teacher["id"],
+        student_id=req.student_id,
+        guidance_type=req.guidance_type,
+        message=req.message,
+        classroom_id=req.classroom_id
+    )
+    return {
+        "status": "success",
+        "message": "Personalized guidance dispatched successfully to student.",
+        "guidance": guidance
+    }
+
+
+@router.get("/guidance")
+async def get_teacher_guidance_endpoint(
+    teacher: dict = Depends(require_teacher)
+):
+    """
+    Returns all personalized guidance and Socratic drills dispatched by the educator,
+    along with student completion status.
+    """
+    guidance_list = get_teacher_dispatched_guidance(teacher["id"])
+    return {
+        "status": "success",
+        "guidance": guidance_list,
+        "count": len(guidance_list)
+    }
+
 
 
 
