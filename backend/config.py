@@ -50,9 +50,9 @@ class Settings(BaseModel):
     SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", "")
     SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     SUPABASE_DB_URL: str = os.getenv("SUPABASE_DB_URL", "")
-    SUPABASE_DB_HOST: str = os.getenv("SUPABASE_DB_HOST", "db.hmxbwitnmrjbtrozkvul.supabase.co")
+    SUPABASE_DB_HOST: str = os.getenv("SUPABASE_DB_HOST", "aws-0-ap-northeast-2.pooler.supabase.com")
     SUPABASE_DB_PORT: int = int(os.getenv("SUPABASE_DB_PORT", 5432))
-    SUPABASE_DB_USER: str = os.getenv("SUPABASE_DB_USER", "postgres")
+    SUPABASE_DB_USER: str = os.getenv("SUPABASE_DB_USER", "postgres.hmxbwitnmrjbtrozkvul")
     SUPABASE_DB_PASSWORD: str = os.getenv("SUPABASE_DB_PASSWORD", "")
     SUPABASE_DB_NAME: str = os.getenv("SUPABASE_DB_NAME", "postgres")
 
