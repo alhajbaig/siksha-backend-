@@ -916,6 +916,38 @@ def create_user(
     return get_user_by_id(user_id)
 
 
+def update_user_role(user_id: str, new_role: str) -> Optional[dict]:
+    """Updates user role across Supabase Cloud PostgreSQL and local SQLite."""
+    role_clean = new_role.strip().lower()
+    now_iso = datetime.utcnow().isoformat()
+
+    # 1. Supabase PostgreSQL
+    try:
+        from backend.services.supabase_service import get_pg_connection, is_supabase_configured
+        if is_supabase_configured():
+            with get_pg_connection() as pg_conn:
+                with pg_conn.cursor() as pg_cur:
+                    pg_cur.execute(
+                        "UPDATE public.users SET role = %s, updated_at = NOW() WHERE id = %s;",
+                        (role_clean, user_id)
+                    )
+                    pg_conn.commit()
+    except Exception as pg_err:
+        print(f"[Supabase Cloud Sync] update_user_role warning: {pg_err}")
+
+    # 2. SQLite
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET role = ?, updated_at = ? WHERE id = ?;", (role_clean, now_iso, user_id))
+        conn.commit()
+        conn.close()
+    except Exception as sqlite_err:
+        print(f"[SQLite Sync] update_user_role warning: {sqlite_err}")
+
+    return get_user_by_id(user_id)
+
+
 def get_user_by_email(email: str) -> Optional[dict]:
     """Fetches user record by email from Supabase Cloud PostgreSQL or local SQLite."""
     if not email:

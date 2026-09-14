@@ -11,7 +11,7 @@ from backend.models.user_model import (
 )
 from backend.db import (
     get_user_by_email, get_user_by_id, create_user, update_user_profile,
-    verify_password, create_session, get_user_from_session, delete_session
+    verify_password, create_session, get_user_from_session, delete_session, update_user_role
 )
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -167,6 +167,11 @@ async def login(credentials: UserLoginRequest):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect password. Please verify your credentials or reset your password."
             )
+        # If user explicitly specified role (e.g., student vs teacher toggle), sync it
+        if credentials.role and credentials.role.value != user.get("role"):
+            updated_user = update_user_role(user["id"], credentials.role.value)
+            if updated_user:
+                user = updated_user
         token = create_session(user["id"])
         return AuthTokenResponse(
             access_token=token,
@@ -216,16 +221,29 @@ async def signup(payload: UserSignUpRequest):
     Registers a new student or teacher in persistent Cloud PostgreSQL and SQLite.
     """
     email_clean = payload.email.strip().lower()
+    target_role = payload.role.value if payload.role else "student"
 
     # 1. Check if user already exists
     existing_user = get_user_by_email(email_clean)
     if existing_user:
         if verify_password(payload.password, existing_user.get("password_hash", ""), existing_user.get("salt", "")):
-            token = create_session(existing_user["id"])
+            # Update user with requested role and full name/profile
+            user = create_user(
+                email=email_clean,
+                password=payload.password,
+                full_name=payload.full_name.strip(),
+                role=target_role,
+                class_grade=payload.class_grade or "Class 12 • Senior Secondary",
+                target_goal=payload.target_goal or "JEE / NEET",
+                institution=payload.institution or "",
+                subject=payload.subject or "",
+                bio="Passionate student exploring concepts with SikshaSaathi AI."
+            )
+            token = create_session(user["id"])
             return AuthTokenResponse(
                 access_token=token,
-                user=_format_user_profile(existing_user),
-                message="Account already exists. Signed in successfully."
+                user=_format_user_profile(user),
+                message="Account updated and signed in successfully."
             )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -237,7 +255,7 @@ async def signup(payload: UserSignUpRequest):
         email=email_clean,
         password=payload.password,
         full_name=payload.full_name.strip(),
-        role=payload.role.value if payload.role else "student",
+        role=target_role,
         class_grade=payload.class_grade or "Class 12 • Senior Secondary",
         target_goal=payload.target_goal or "JEE / NEET",
         institution=payload.institution or "",
